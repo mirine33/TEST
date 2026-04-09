@@ -27,21 +27,73 @@ PDF_FONT_BOLD = BASE_DIR / "assets" / "fonts" / "NanumGothic-Bold.ttf"
 PDF_FONT_NAME = "NanumGothic"
 PDF_FONT_BOLD_NAME = "NanumGothic-Bold"
 
+PHOTO_SLOTS = (
+    {
+        "key": "front",
+        "title": "정면 사진",
+        "description": "어깨와 골반의 좌우 높이, 몸통 중심 정렬을 확인하기 좋습니다.",
+        "short": "정면",
+    },
+    {
+        "key": "side",
+        "title": "측면 사진",
+        "description": "고개 전방 자세, 흉추 굴곡, 골반 기울기 추정에 도움이 됩니다.",
+        "short": "측면",
+    },
+    {
+        "key": "seated",
+        "title": "의자에 앉은 자세",
+        "description": "업무 자세, 허리 지지, 앉은 상태의 좌우 밸런스를 확인합니다.",
+        "short": "앉은 자세",
+    },
+)
+
 SYSTEM_PROMPT = """
 당신은 물리치료/운동 코치 보조 AI입니다.
-입력된 사진 1장을 보고, 근골격계질환 예방 관점에서 자세 위험 신호를 추정해 운동을 제안하세요.
+입력으로 정면 사진, 측면 사진, 의자에 앉은 자세 사진 총 3장이 제공됩니다.
+이 3장을 함께 보고 근골격계질환 예방 관점에서 자세 위험 신호를 추정하고 운동을 제안하세요.
+
 중요:
 1) 진단이 아니라 예방 목적의 일반 가이드로 작성한다.
-2) 사진만으로 확정할 수 없는 내용은 "추정"이라고 표현한다.
-3) 위험하거나 통증 유발 가능성이 있는 과격한 운동은 피한다.
-4) 초보자가 집에서 수행 가능한 운동 중심으로 작성한다.
-5) 반드시 한국어로 작성한다.
-6) 아래 JSON 형식으로만 응답한다. 코드블록 금지.
+2) 사진만으로 확정할 수 없는 내용은 반드시 "추정"이라고 표현한다.
+3) 좌우 밸런스(어깨 높이, 몸통 기울기, 체중 분배, 골반 수평 추정)를 반드시 체크한다.
+4) 전체 결과는 1단계~5단계로 세분화한다.
+5) 단계 의미는 다음과 같다.
+   - 1단계: 매우 양호
+   - 2단계: 경미한 불균형
+   - 3단계: 주의 필요
+   - 4단계: 교정 필요
+   - 5단계: 집중 관리 필요
+6) 과격한 운동은 피하고 초보자가 집이나 사무실에서 할 수 있는 운동을 우선 추천한다.
+7) 반드시 한국어로 작성한다.
+8) 아래 JSON 형식으로만 응답한다. 코드블록 금지.
+9) 각 사진별 분석은 front, side, seated 키에 맞춰 작성한다.
 
 {
-  "posture_summary": "한 문단 요약",
-  "risk_level": "low 또는 medium 또는 high",
-  "observed_signs": ["관찰/추정 신호1", "관찰/추정 신호2"],
+  "overall_summary": "전체 자세 한 문단 요약",
+  "overall_level": 1,
+  "overall_reason": "왜 이 단계를 판단했는지 1~2문장",
+  "observed_signs": ["전체 관점 핵심 신호1", "핵심 신호2"],
+  "left_right_balance": {
+    "level": 1,
+    "summary": "좌우 밸런스 한 문단 요약",
+    "findings": ["좌우 밸런스 관련 관찰/추정 1", "관찰/추정 2"]
+  },
+  "view_analysis": {
+    "front": {
+      "summary": "정면 사진 요약",
+      "findings": ["정면 관찰/추정 1", "정면 관찰/추정 2"]
+    },
+    "side": {
+      "summary": "측면 사진 요약",
+      "findings": ["측면 관찰/추정 1", "측면 관찰/추정 2"]
+    },
+    "seated": {
+      "summary": "앉은 자세 사진 요약",
+      "findings": ["앉은 자세 관찰/추정 1", "앉은 자세 관찰/추정 2"]
+    }
+  },
+  "priority_areas": ["우선 관리 부위1", "우선 관리 부위2"],
   "recommended_exercises": [
     {
       "name": "운동명",
@@ -63,6 +115,7 @@ def initialize_state() -> None:
         "analysis_result": None,
         "analysis_signature": None,
         "analysis_filename": None,
+        "analysis_filenames": None,
         "analysis_image_bytes": None,
         "analysis_timestamp": None,
         "analysis_model": None,
@@ -289,6 +342,15 @@ def build_signature(raw_bytes: bytes) -> str:
     return hashlib.sha1(raw_bytes).hexdigest()
 
 
+def build_bundle_signature(image_bytes_map: Dict[str, bytes]) -> str:
+    digest = hashlib.sha1()
+    for slot in PHOTO_SLOTS:
+        slot_key = slot["key"]
+        digest.update(slot_key.encode("utf-8"))
+        digest.update(image_bytes_map[slot_key])
+    return digest.hexdigest()
+
+
 def extract_json_text(raw_text: str) -> Dict[str, Any]:
     raw_text = raw_text.strip()
     try:
@@ -301,9 +363,32 @@ def extract_json_text(raw_text: str) -> Dict[str, Any]:
         raise
 
 
-def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
+def analyze_posture(images: Dict[str, Image.Image], model: str) -> Dict[str, Any]:
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    data_url = image_to_data_url(image)
+    content = [
+        {
+            "type": "input_text",
+            "text": (
+                "정면, 측면, 앉은 자세 사진을 함께 분석해서 "
+                "좌우 밸런스와 5단계 결과를 포함한 JSON으로 답변해줘."
+            ),
+        }
+    ]
+
+    for slot in PHOTO_SLOTS:
+        slot_key = slot["key"]
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"{slot['title']}입니다. 이 관점의 특징을 반영해 분석해줘.",
+            }
+        )
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": image_to_data_url(images[slot_key]),
+            }
+        )
 
     response = client.responses.create(
         model=model,
@@ -314,10 +399,7 @@ def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
             },
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "사진을 분석해 JSON으로 답변해줘."},
-                    {"type": "input_image", "image_url": data_url},
-                ],
+                "content": content,
             },
         ],
         temperature=0.2,
@@ -337,35 +419,69 @@ def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
     return extract_json_text(output_text)
 
 
-def risk_meta(level: str) -> Dict[str, str]:
-    normalized = str(level).lower()
-    if normalized == "low":
+def risk_meta(level: Any) -> Dict[str, str]:
+    try:
+        normalized = int(level)
+    except (TypeError, ValueError):
+        normalized = 3
+
+    if normalized <= 1:
         return {
-            "label": "낮음",
+            "label": "1단계",
+            "title": "매우 양호",
+            "badge": "1단계 · 매우 양호",
             "tone": "low",
-            "note": "현재 사진 기준으로는 비교적 안정적인 편입니다.",
+            "note": "현재 사진 기준으로는 큰 불균형이 적은 편으로 보입니다.",
             "pdf_color": "#2E8B57",
         }
-    if normalized == "medium":
+    if normalized == 2:
         return {
-            "label": "중간",
+            "label": "2단계",
+            "title": "경미한 불균형",
+            "badge": "2단계 · 경미한 불균형",
+            "tone": "low",
+            "note": "작은 불균형이 보여 생활 습관과 가벼운 교정 운동이 도움이 됩니다.",
+            "pdf_color": "#4C9E68",
+        }
+    if normalized == 3:
+        return {
+            "label": "3단계",
+            "title": "주의 필요",
+            "badge": "3단계 · 주의 필요",
             "tone": "medium",
-            "note": "반복 누적 시 목과 어깨 부담이 커질 수 있습니다.",
+            "note": "누적 피로와 통증 예방을 위해 정기적인 관리가 필요해 보입니다.",
             "pdf_color": "#B7791F",
         }
-    if normalized == "high":
+    if normalized == 4:
         return {
-            "label": "높음",
+            "label": "4단계",
+            "title": "교정 필요",
+            "badge": "4단계 · 교정 필요",
             "tone": "high",
-            "note": "예방 운동과 생활 습관 교정이 특히 중요해 보입니다.",
-            "pdf_color": "#C84F46",
+            "note": "자세 교정과 운동 습관 개선을 더 적극적으로 시작하는 것이 좋습니다.",
+            "pdf_color": "#D16A33",
         }
     return {
-        "label": str(level),
-        "tone": "neutral",
-        "note": "참고용 결과입니다.",
-        "pdf_color": "#0F6A57",
+        "label": "5단계",
+        "title": "집중 관리 필요",
+        "badge": "5단계 · 집중 관리 필요",
+        "tone": "high",
+        "note": "불균형이 비교적 뚜렷해 보여 집중적인 예방 관리가 필요해 보입니다.",
+        "pdf_color": "#C84F46",
     }
+
+
+def get_view_data(result: Dict[str, Any], key: str) -> Dict[str, Any]:
+    return result.get("view_analysis", {}).get(key, {})
+
+
+def count_observed_signs(result: Dict[str, Any]) -> int:
+    total = len(result.get("observed_signs", []))
+    balance = result.get("left_right_balance", {})
+    total += len(balance.get("findings", []))
+    for slot in PHOTO_SLOTS:
+        total += len(get_view_data(result, slot["key"]).get("findings", []))
+    return total
 
 
 def format_html_text(value: str) -> str:
@@ -384,14 +500,15 @@ def render_hero() -> None:
         """
         <section class="hero-shell">
             <div class="hero-kicker">Posture Insight Studio</div>
-            <h1 class="hero-title">사진 한 장을<br>실행 가능한 예방 리포트로</h1>
+            <h1 class="hero-title">세 방향 사진을<br>정밀한 예방 리포트로</h1>
             <p class="hero-copy">
-                자세 사진을 분석해 목, 어깨, 흉추 중심의 부담 신호를 정리하고
-                바로 실천할 수 있는 운동과 생활 습관을 보기 좋은 리포트로 제공합니다.
+                정면, 측면, 앉은 자세 사진을 함께 분석해 좌우 밸런스와 자세 습관을 더 세밀하게 읽고
+                5단계 결과와 실행 가능한 교정 가이드를 보고서처럼 정리합니다.
             </p>
             <div class="hero-pills">
-                <span class="hero-pill">AI 자세 분석</span>
-                <span class="hero-pill">보고서형 UI</span>
+                <span class="hero-pill">3면 사진 분석</span>
+                <span class="hero-pill">좌우 밸런스 체크</span>
+                <span class="hero-pill">5단계 결과</span>
                 <span class="hero-pill">PDF 다운로드</span>
             </div>
         </section>
@@ -537,25 +654,31 @@ def build_pdf_styles() -> Dict[str, ParagraphStyle]:
 
 
 def build_metric_table(data: Dict[str, Any], styles: Dict[str, ParagraphStyle]) -> Table:
-    risk = risk_meta(data.get("risk_level", "unknown"))
-    observed_count = len(data.get("observed_signs", []))
-    exercise_count = len(data.get("recommended_exercises", []))
+    overall = risk_meta(data.get("overall_level", 3))
+    balance = risk_meta(data.get("left_right_balance", {}).get("level", 3))
+    observed_count = count_observed_signs(data)
 
     metric_rows = [
         [
-            Paragraph("예상 위험도", styles["label"]),
-            Paragraph(pdf_text(risk["label"]), styles["value"]),
-            Paragraph("관찰 신호 수", styles["label"]),
+            Paragraph("전체 분석 단계", styles["label"]),
+            Paragraph(pdf_text(overall["label"]), styles["value"]),
+            Paragraph("좌우 밸런스", styles["label"]),
+            Paragraph(pdf_text(balance["label"]), styles["value"]),
+            Paragraph("관찰 포인트 수", styles["label"]),
             Paragraph(str(observed_count), styles["value"]),
-            Paragraph("추천 운동 수", styles["label"]),
-            Paragraph(str(exercise_count), styles["value"]),
         ],
         [
-            Paragraph(pdf_text(risk["note"]), styles["small"]),
+            Paragraph(pdf_text(f"{overall['title']} · {overall['note']}"), styles["small"]),
             "",
-            Paragraph("자세 이상 징후 추정 개수", styles["small"]),
+            Paragraph(
+                pdf_text(
+                    f"{balance['title']} · "
+                    f"{data.get('left_right_balance', {}).get('summary', '좌우 밸런스 요약 정보가 없습니다.')}"
+                ),
+                styles["small"],
+            ),
             "",
-            Paragraph("실행 가능한 운동 개수", styles["small"]),
+            Paragraph("전체 시야와 사진별 관찰을 합산한 참고 개수입니다.", styles["small"]),
             "",
         ],
     ]
@@ -647,8 +770,8 @@ def draw_pdf_footer(canvas, doc) -> None:
 
 def build_pdf_report(
     report_data: Dict[str, Any],
-    image_bytes: bytes,
-    image_name: str,
+    image_bytes_map: Dict[str, bytes],
+    image_names: Dict[str, str],
     analyzed_at: str,
 ) -> bytes:
     register_pdf_fonts()
@@ -668,19 +791,41 @@ def build_pdf_report(
     story: List[Any] = []
     story.append(Paragraph("근골격계 예방 분석 리포트", styles["title"]))
     story.append(Paragraph(f"생성 시각: {pdf_text(analyzed_at)}", styles["meta"]))
-    story.append(Paragraph(f"분석 파일: {pdf_text(image_name)}", styles["meta"]))
-    story.append(Spacer(1, 4))
-    story.append(fit_pdf_image(image_bytes, doc.width, 72 * mm))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("분석 자료: 정면, 측면, 앉은 자세 3종", styles["meta"]))
     story.append(build_metric_table(report_data, styles))
     story.append(Spacer(1, 12))
 
-    story.append(Paragraph("자세 요약", styles["section"]))
-    story.append(Paragraph(pdf_text(report_data.get("posture_summary", "요약 정보가 없습니다.")), styles["body"]))
+    story.append(Paragraph("전체 자세 요약", styles["section"]))
+    story.append(Paragraph(pdf_text(report_data.get("overall_summary", "요약 정보가 없습니다.")), styles["body"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(pdf_text(report_data.get("overall_reason", "판단 이유 정보가 없습니다.")), styles["body"]))
     story.append(Spacer(1, 10))
 
-    story.append(build_bullet_table("관찰 및 추정 신호", report_data.get("observed_signs", []), styles))
+    story.append(build_bullet_table("핵심 관찰 신호", report_data.get("observed_signs", []), styles))
     story.append(Spacer(1, 10))
+    story.append(build_bullet_table("우선 관리 부위", report_data.get("priority_areas", []), styles))
+    story.append(Spacer(1, 10))
+
+    balance = report_data.get("left_right_balance", {})
+    balance_header = f"좌우 밸런스 ({risk_meta(balance.get('level', 3))['badge']})"
+    story.append(Paragraph(balance_header, styles["section"]))
+    story.append(Paragraph(pdf_text(balance.get("summary", "좌우 밸런스 요약 정보가 없습니다.")), styles["body"]))
+    story.append(Spacer(1, 8))
+    story.append(build_bullet_table("좌우 밸런스 세부 관찰", balance.get("findings", []), styles))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("사진별 분석", styles["section"]))
+    for slot in PHOTO_SLOTS:
+        slot_data = get_view_data(report_data, slot["key"])
+        story.append(Paragraph(slot["title"], styles["card_title"]))
+        story.append(Paragraph(pdf_text(image_names.get(slot["key"], "-")), styles["meta"]))
+        if slot["key"] in image_bytes_map:
+            story.append(fit_pdf_image(image_bytes_map[slot["key"]], doc.width, 56 * mm))
+            story.append(Spacer(1, 6))
+        story.append(Paragraph(pdf_text(slot_data.get("summary", "요약 정보가 없습니다.")), styles["body"]))
+        story.append(Spacer(1, 6))
+        story.append(build_bullet_table(f"{slot['short']} 관찰 포인트", slot_data.get("findings", []), styles))
+        story.append(Spacer(1, 10))
 
     exercises = report_data.get("recommended_exercises", [])
     story.append(Paragraph("추천 운동", styles["section"]))
@@ -722,17 +867,36 @@ def build_pdf_report(
 @st.cache_data(show_spinner=False)
 def build_pdf_report_cached(
     report_json: str,
-    image_bytes: bytes,
-    image_name: str,
+    front_image_bytes: bytes,
+    side_image_bytes: bytes,
+    seated_image_bytes: bytes,
+    front_image_name: str,
+    side_image_name: str,
+    seated_image_name: str,
     analyzed_at: str,
 ) -> bytes:
-    return build_pdf_report(json.loads(report_json), image_bytes, image_name, analyzed_at)
+    return build_pdf_report(
+        json.loads(report_json),
+        {
+            "front": front_image_bytes,
+            "side": side_image_bytes,
+            "seated": seated_image_bytes,
+        },
+        {
+            "front": front_image_name,
+            "side": side_image_name,
+            "seated": seated_image_name,
+        },
+        analyzed_at,
+    )
 
 
-def build_download_filename(image_name: Optional[str]) -> str:
-    stem = Path(image_name or "analysis").stem
+def build_download_filename(image_name: Optional[Any]) -> str:
+    if isinstance(image_name, dict):
+        image_name = image_name.get("front") or image_name.get("side") or image_name.get("seated")
+    stem = Path(str(image_name or "analysis")).stem
     safe_stem = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in stem)
-    return f"{safe_stem}_report.pdf"
+    return f"{safe_stem}_multiview_report.pdf"
 
 
 def format_timestamp(iso_text: Optional[str]) -> str:
@@ -746,10 +910,13 @@ def format_timestamp(iso_text: Optional[str]) -> str:
 
 
 def render_result_dashboard(result: Dict[str, Any], pdf_bytes: Optional[bytes]) -> None:
-    risk = risk_meta(result.get("risk_level", "unknown"))
+    overall = risk_meta(result.get("overall_level", 3))
+    balance = result.get("left_right_balance", {})
+    balance_meta = risk_meta(balance.get("level", 3))
     observed_signs = result.get("observed_signs", [])
     exercises = result.get("recommended_exercises", [])
     daily_habits = result.get("daily_habits", [])
+    priority_areas = result.get("priority_areas", [])
 
     st.markdown(
         """
@@ -779,13 +946,13 @@ def render_result_dashboard(result: Dict[str, Any], pdf_bytes: Optional[bytes]) 
 
     metric_cols = st.columns(3, gap="medium")
     with metric_cols[0]:
-        render_metric_card("예상 위험도", risk["label"], risk["note"], risk["tone"])
+        render_metric_card("전체 분석 단계", overall["badge"], overall["note"], overall["tone"])
     with metric_cols[1]:
         render_metric_card(
-            "관찰 신호",
-            str(len(observed_signs)),
-            "사진에서 추정된 신호 개수입니다.",
-            "neutral",
+            "좌우 밸런스",
+            balance_meta["badge"],
+            balance.get("summary", "좌우 밸런스 요약 정보가 없습니다."),
+            balance_meta["tone"],
         )
     with metric_cols[2]:
         render_metric_card(
@@ -796,19 +963,59 @@ def render_result_dashboard(result: Dict[str, Any], pdf_bytes: Optional[bytes]) 
         )
 
     render_content_card(
-        "Posture Summary",
-        "자세 요약",
-        f"<p>{format_html_text(result.get('posture_summary', '요약 정보가 없습니다.'))}</p>",
+        "Overall Summary",
+        "전체 자세 요약",
+        (
+            f"<p>{format_html_text(result.get('overall_summary', '요약 정보가 없습니다.'))}</p>"
+            f"<p style='margin-top:0.7rem'>{format_html_text(result.get('overall_reason', '판단 이유 정보가 없습니다.'))}</p>"
+        ),
     )
 
     insight_cols = st.columns(2, gap="medium")
     with insight_cols[0]:
         render_content_card(
             "Observed Signs",
-            "관찰 및 추정 신호",
+            "핵심 관찰 신호",
             build_list_html(observed_signs, "관찰/추정 신호를 찾지 못했습니다."),
         )
     with insight_cols[1]:
+        render_content_card(
+            "Priority Areas",
+            "우선 관리 부위",
+            build_list_html(priority_areas, "우선 관리 부위 정보가 없습니다."),
+        )
+
+    st.markdown(
+        """
+        <div class="section-heading">
+            <h2>사진별 분석</h2>
+            <p>정면, 측면, 앉은 자세를 각각 나누어 관찰 포인트를 정리했습니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    view_cols = st.columns(3, gap="medium")
+    for index, slot in enumerate(PHOTO_SLOTS):
+        slot_data = get_view_data(result, slot["key"])
+        with view_cols[index]:
+            render_content_card(
+                slot["short"],
+                slot["title"],
+                (
+                    f"<p>{format_html_text(slot_data.get('summary', '요약 정보가 없습니다.'))}</p>"
+                    f"{build_list_html(slot_data.get('findings', []), '세부 관찰 포인트가 없습니다.')}"
+                ),
+            )
+
+    balance_cols = st.columns(2, gap="medium")
+    with balance_cols[0]:
+        render_content_card(
+            "Balance Check",
+            "좌우 밸런스 세부 관찰",
+            build_list_html(balance.get("findings", []), "좌우 밸런스 세부 관찰 정보가 없습니다."),
+        )
+    with balance_cols[1]:
         render_content_card(
             "Daily Habits",
             "생활 습관 교정",
@@ -862,56 +1069,85 @@ def main() -> None:
     apply_styles()
     render_hero()
 
-    top_left, top_right = st.columns([1.25, 0.95], gap="large")
-    uploaded = None
-    image = None
-    image_bytes: Optional[bytes] = None
+    st.markdown(
+        """
+        <div class="section-heading">
+            <h2>사진 업로드</h2>
+            <p>정면, 측면, 의자에 앉은 자세 사진을 모두 올리면 좌우 밸런스와 5단계 결과를 함께 분석합니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    upload_cols = st.columns(3, gap="medium")
+    uploaded_files: Dict[str, Any] = {}
+    images: Dict[str, Image.Image] = {}
+    image_bytes_map: Dict[str, bytes] = {}
     current_signature: Optional[str] = None
 
-    with top_left:
-        with st.container(border=True):
-            st.markdown("<div class='panel-title'>사진 업로드</div>", unsafe_allow_html=True)
-            st.markdown(
-                "<div class='panel-copy'>정면 또는 측면에서 목, 어깨, 상체가 잘 보이는 사진을 올려주세요.</div>",
-                unsafe_allow_html=True,
-            )
-            uploaded = st.file_uploader(
-                "자세가 보이는 사진 업로드",
-                type=["jpg", "jpeg", "png"],
-                label_visibility="collapsed",
-            )
+    for index, slot in enumerate(PHOTO_SLOTS):
+        with upload_cols[index]:
+            with st.container(border=True):
+                st.markdown(f"<div class='panel-title'>{slot['title']}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='panel-copy'>{slot['description']}</div>",
+                    unsafe_allow_html=True,
+                )
+                uploaded = st.file_uploader(
+                    slot["title"],
+                    type=["jpg", "jpeg", "png"],
+                    key=f"upload_{slot['key']}",
+                    label_visibility="collapsed",
+                )
+                uploaded_files[slot["key"]] = uploaded
 
-            if uploaded is not None:
-                image_bytes = uploaded.getvalue()
-                current_signature = build_signature(image_bytes)
-                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                st.image(image, caption="업로드된 사진", use_container_width=True)
+                if uploaded is not None:
+                    raw_bytes = uploaded.getvalue()
+                    image_bytes_map[slot["key"]] = raw_bytes
+                    images[slot["key"]] = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                    st.image(images[slot["key"]], caption=uploaded.name, use_container_width=True)
+                else:
+                    st.caption("아직 업로드되지 않았습니다.")
 
-    with top_right:
+    if len(image_bytes_map) == len(PHOTO_SLOTS):
+        current_signature = build_bundle_signature(image_bytes_map)
+
+    control_left, control_right = st.columns([1.15, 0.85], gap="large")
+    with control_left:
         with st.container(border=True):
             st.markdown("<div class='panel-title'>분석 설정</div>", unsafe_allow_html=True)
             st.markdown(
-                "<div class='panel-copy'>모델을 확인한 뒤 분석을 시작하세요. 분석 결과는 바로 보고서 형태로 정리됩니다.</div>",
+                "<div class='panel-copy'>세 장의 사진이 모두 준비되면 좌우 비대칭과 자세 습관을 종합해서 분석합니다.</div>",
                 unsafe_allow_html=True,
             )
             default_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
             model = st.text_input("OpenAI 모델", value=default_model, help="예: gpt-4.1-mini")
             st.caption("환경변수 `OPENAI_API_KEY`가 필요합니다.")
             analyze_clicked = st.button(
-                "AI 분석 시작",
+                "3면 자세 분석 시작",
                 type="primary",
                 use_container_width=True,
-                disabled=image is None,
+                disabled=len(images) != len(PHOTO_SLOTS),
             )
 
-        st.markdown("<div style='height: 0.7rem'></div>", unsafe_allow_html=True)
+            if len(images) != len(PHOTO_SLOTS):
+                st.info("정면, 측면, 의자에 앉은 자세 사진을 모두 업로드하면 분석 버튼이 활성화됩니다.")
+            else:
+                st.success("세 장의 사진이 준비되었습니다. 분석을 시작할 수 있습니다.")
+
+    with control_right:
         with st.container(border=True):
+            st.markdown("<div class='panel-title'>분석 포인트</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='panel-copy'>사진 세 장을 종합해 아래 항목을 함께 판단합니다.</div>",
+                unsafe_allow_html=True,
+            )
             st.markdown(
                 """
                 <div class="mini-note">
                     <strong>이 앱이 해주는 일</strong>
-                    사진에서 자세 위험 신호를 추정하고, 부위별 운동 방법, 권장량,
-                    생활 습관 팁, 주의 문구까지 한 번에 정리합니다.
+                    정면에서 좌우 높이 차를 보고, 측면에서 머리와 등 정렬을 보고,
+                    앉은 자세에서 업무 습관과 체중 분배를 함께 추정합니다.
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -919,29 +1155,37 @@ def main() -> None:
             st.markdown(
                 """
                 <ul class="feature-list">
-                    <li>결과를 보기 좋은 카드형 리포트로 표시</li>
-                    <li>추천 운동 정보를 한글 PDF로 저장 가능</li>
-                    <li>진단이 아닌 예방 목적의 참고 가이드 제공</li>
+                    <li>전체 자세를 1단계부터 5단계까지 세분화</li>
+                    <li>좌우 밸런스를 별도 단계로 정리</li>
+                    <li>정면, 측면, 앉은 자세별 관찰 포인트 제공</li>
+                    <li>추천 운동과 PDF 보고서까지 한 번에 생성</li>
                 </ul>
                 """,
                 unsafe_allow_html=True,
             )
 
     if analyze_clicked:
-        if image is None or image_bytes is None or current_signature is None:
-            st.error("먼저 사진을 업로드해 주세요.")
+        if len(images) != len(PHOTO_SLOTS) or current_signature is None:
+            st.error("정면, 측면, 의자에 앉은 자세 사진을 모두 업로드해 주세요.")
             st.stop()
         if not os.getenv("OPENAI_API_KEY"):
             st.error("`OPENAI_API_KEY` 환경변수가 설정되지 않았습니다.")
             st.stop()
 
-        with st.spinner("사진을 분석하고 리포트를 정리하고 있습니다..."):
+        with st.spinner("세 장의 사진을 분석하고 리포트를 정리하고 있습니다..."):
             try:
-                result = analyze_posture(image, model=model)
+                result = analyze_posture(images, model=model)
                 st.session_state["analysis_result"] = result
                 st.session_state["analysis_signature"] = current_signature
-                st.session_state["analysis_filename"] = uploaded.name if uploaded is not None else "image.jpg"
-                st.session_state["analysis_image_bytes"] = image_to_jpeg_bytes(image)
+                st.session_state["analysis_filename"] = {
+                    slot["key"]: uploaded_files[slot["key"]].name
+                    for slot in PHOTO_SLOTS
+                }
+                st.session_state["analysis_filenames"] = st.session_state["analysis_filename"]
+                st.session_state["analysis_image_bytes"] = {
+                    slot["key"]: image_to_jpeg_bytes(images[slot["key"]])
+                    for slot in PHOTO_SLOTS
+                }
                 st.session_state["analysis_timestamp"] = datetime.now().isoformat(timespec="seconds")
                 st.session_state["analysis_model"] = model
                 st.success("분석이 완료되었습니다. 아래에서 결과를 확인하고 PDF로 내려받을 수 있습니다.")
@@ -951,17 +1195,27 @@ def main() -> None:
     active_result = st.session_state.get("analysis_result")
     active_signature = st.session_state.get("analysis_signature")
 
-    if uploaded is not None and active_result and current_signature and active_signature != current_signature:
-        st.info("새 사진이 업로드되었습니다. 최신 결과를 보려면 `AI 분석 시작` 버튼을 다시 눌러 주세요.")
+    if active_result and any(uploaded_files.values()) and len(images) != len(PHOTO_SLOTS):
+        st.info("새 분석용 사진을 업로드하는 중입니다. 세 장이 모두 준비되면 다시 분석해 주세요.")
+        active_result = None
+
+    if active_result and current_signature and active_signature != current_signature:
+        st.info("업로드된 사진이 바뀌었습니다. 최신 결과를 보려면 `3면 자세 분석 시작` 버튼을 다시 눌러 주세요.")
         active_result = None
 
     if active_result and st.session_state.get("analysis_image_bytes"):
         pdf_bytes = None
         try:
+            stored_images = st.session_state["analysis_image_bytes"]
+            stored_names = st.session_state.get("analysis_filenames") or st.session_state.get("analysis_filename") or {}
             pdf_bytes = build_pdf_report_cached(
                 json.dumps(active_result, ensure_ascii=False, sort_keys=True),
-                st.session_state["analysis_image_bytes"],
-                st.session_state.get("analysis_filename", "image.jpg"),
+                stored_images["front"],
+                stored_images["side"],
+                stored_images["seated"],
+                stored_names.get("front", "front.jpg"),
+                stored_names.get("side", "side.jpg"),
+                stored_names.get("seated", "seated.jpg"),
                 format_timestamp(st.session_state.get("analysis_timestamp")),
             )
         except Exception as exc:
@@ -973,7 +1227,7 @@ def main() -> None:
             """
             <div class="section-heading">
                 <h2>분석 전 안내</h2>
-                <p>아래 조건을 맞추면 결과 품질이 더 좋아집니다.</p>
+                <p>세 장의 사진이 서로 다른 관점을 보완해 줄수록 결과 품질이 좋아집니다.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -983,10 +1237,11 @@ def main() -> None:
             <div class="empty-card">
                 <div class="content-eyebrow">Preparation Tips</div>
                 <h3>사진을 이렇게 준비해 보세요</h3>
-                <p>몸통이 잘리거나 고개가 완전히 가려지지 않도록 촬영하면 더 정확한 추정에 도움이 됩니다.</p>
+                <p>정면, 측면, 앉은 자세를 각각 또렷하게 보여주면 좌우 밸런스와 습관성 자세를 더 잘 읽을 수 있습니다.</p>
                 <ul>
-                    <li>목, 어깨, 등이 함께 보이는 구도 추천</li>
-                    <li>앉은 자세라면 의자와 상체가 동시에 보이도록 촬영</li>
+                    <li>정면 사진은 어깨와 골반이 모두 보이게 촬영</li>
+                    <li>측면 사진은 귀, 어깨, 골반 선이 보이게 촬영</li>
+                    <li>앉은 자세 사진은 의자와 상체가 함께 보이게 촬영</li>
                     <li>어두운 사진보다 밝고 흔들림 없는 사진 사용</li>
                 </ul>
             </div>
