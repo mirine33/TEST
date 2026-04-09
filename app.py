@@ -2,7 +2,7 @@ import base64
 import io
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import streamlit as st
 from openai import OpenAI
@@ -40,6 +40,81 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+            :root {
+                --bg: #f6fbf9;
+                --panel: #ffffff;
+                --primary: #127b62;
+                --primary-soft: #d7efe7;
+                --text: #11322b;
+                --warn: #f7b500;
+                --danger: #e24a4a;
+            }
+            .stApp {
+                background: radial-gradient(circle at 20% 0%, #e7f6f0 0, var(--bg) 55%);
+                color: var(--text);
+            }
+            .hero {
+                background: linear-gradient(125deg, #106b56, #1a8f71);
+                color: white;
+                border-radius: 14px;
+                padding: 18px 18px 14px 18px;
+                margin-bottom: 12px;
+            }
+            .hero h1 {
+                margin: 0;
+                font-size: 1.45rem;
+                letter-spacing: -0.3px;
+            }
+            .hero p {
+                margin: 6px 0 0 0;
+                opacity: 0.95;
+                font-size: 0.95rem;
+            }
+            .step {
+                background: var(--panel);
+                border: 1px solid #dbe7e2;
+                border-left: 4px solid var(--primary);
+                border-radius: 10px;
+                padding: 10px 12px;
+                margin: 6px 0;
+                font-size: 0.92rem;
+            }
+            .risk-badge {
+                display: inline-block;
+                border-radius: 999px;
+                padding: 4px 10px;
+                font-size: 0.83rem;
+                font-weight: 700;
+            }
+            .risk-low { background: #d7f3e5; color: #0f6c49; }
+            .risk-medium { background: #fff1cf; color: #8e5d00; }
+            .risk-high { background: #ffd8d8; color: #9f1f1f; }
+            .exercise-card {
+                background: var(--panel);
+                border: 1px solid #dbe7e2;
+                border-radius: 12px;
+                padding: 12px;
+                margin-bottom: 10px;
+            }
+            .exercise-title {
+                color: var(--primary);
+                font-size: 1.02rem;
+                font-weight: 700;
+                margin-bottom: 4px;
+            }
+            .label {
+                font-weight: 700;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def image_to_data_url(image: Image.Image) -> str:
     buffered = io.BytesIO()
     image.save(buffered, format="JPEG")
@@ -73,10 +148,7 @@ def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "input_text",
-                        "text": "사진을 분석해 JSON으로 답변해줘.",
-                    },
+                    {"type": "input_text", "text": "사진을 분석해 JSON으로 답변해줘."},
                     {"type": "input_image", "image_url": data_url},
                 ],
             },
@@ -86,7 +158,6 @@ def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
 
     output_text = getattr(response, "output_text", None)
     if not output_text:
-        # SDK 버전에 따라 output_text가 없을 수 있어 fallback 처리
         output_text = ""
         for item in getattr(response, "output", []):
             for content in getattr(item, "content", []):
@@ -94,42 +165,74 @@ def analyze_posture(image: Image.Image, model: str) -> Dict[str, Any]:
                     output_text += getattr(content, "text", "")
 
     if not output_text:
-        raise RuntimeError("모델 응답을 텍스트로 읽지 못했습니다.")
+        raise RuntimeError("모델 응답 텍스트를 확인하지 못했습니다.")
 
     return extract_json_text(output_text)
 
 
+def risk_meta(level: str) -> Dict[str, str]:
+    low_level = str(level).lower()
+    if low_level == "low":
+        return {"label": "낮음", "class": "risk-low", "emoji": "🟢"}
+    if low_level == "medium":
+        return {"label": "중간", "class": "risk-medium", "emoji": "🟠"}
+    if low_level == "high":
+        return {"label": "높음", "class": "risk-high", "emoji": "🔴"}
+    return {"label": str(level), "class": "risk-medium", "emoji": "🟠"}
+
+
+def render_list(items: List[str], empty_text: str) -> None:
+    if not items:
+        st.info(empty_text)
+        return
+    for item in items:
+        st.markdown(f"- {item}")
+
+
 def render_result(data: Dict[str, Any]) -> None:
-    st.subheader("분석 요약")
-    st.write(data.get("posture_summary", "요약 정보 없음"))
+    st.markdown("## 분석 결과")
+    posture_summary = data.get("posture_summary", "요약 정보가 없습니다.")
+    risk = risk_meta(data.get("risk_level", "unknown"))
 
-    risk_level = data.get("risk_level", "unknown")
-    risk_label = {
-        "low": "낮음",
-        "medium": "중간",
-        "high": "높음",
-    }.get(str(risk_level).lower(), str(risk_level))
-    st.metric("예상 위험도", risk_label)
+    col1, col2 = st.columns([2, 1], gap="small")
+    with col1:
+        st.write(posture_summary)
+    with col2:
+        st.metric("예상 위험도", f"{risk['emoji']} {risk['label']}")
+        st.markdown(
+            f"<span class='risk-badge {risk['class']}'>예방 관리 권장</span>",
+            unsafe_allow_html=True,
+        )
 
-    st.subheader("관찰/추정 신호")
-    for sign in data.get("observed_signs", []):
-        st.write(f"- {sign}")
+    tab1, tab2, tab3 = st.tabs(["관찰 신호", "추천 운동", "생활 습관"])
 
-    st.subheader("추천 운동")
-    exercises = data.get("recommended_exercises", [])
-    if not exercises:
-        st.info("추천 운동 정보가 없습니다.")
-    for ex in exercises:
-        with st.expander(ex.get("name", "운동")):
-            st.write(f"대상 부위: {ex.get('target', '-')}")
-            st.write(f"방법: {ex.get('how_to', '-')}")
-            st.write(f"권장량: {ex.get('sets_reps', '-')}")
-            st.write(f"빈도: {ex.get('frequency', '-')}")
-            st.write(f"주의사항: {ex.get('caution', '-')}")
+    with tab1:
+        render_list(
+            data.get("observed_signs", []),
+            "관찰/추정 신호를 찾지 못했습니다.",
+        )
 
-    st.subheader("생활 습관 교정")
-    for habit in data.get("daily_habits", []):
-        st.write(f"- {habit}")
+    with tab2:
+        exercises = data.get("recommended_exercises", [])
+        if not exercises:
+            st.info("추천 운동 정보가 없습니다.")
+        for ex in exercises:
+            st.markdown(
+                (
+                    "<div class='exercise-card'>"
+                    f"<div class='exercise-title'>{ex.get('name', '운동')}</div>"
+                    f"<div><span class='label'>대상 부위</span>: {ex.get('target', '-')}</div>"
+                    f"<div><span class='label'>방법</span>: {ex.get('how_to', '-')}</div>"
+                    f"<div><span class='label'>권장량</span>: {ex.get('sets_reps', '-')}</div>"
+                    f"<div><span class='label'>빈도</span>: {ex.get('frequency', '-')}</div>"
+                    f"<div><span class='label'>주의</span>: {ex.get('caution', '-')}</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+    with tab3:
+        render_list(data.get("daily_habits", []), "생활 습관 교정 팁이 없습니다.")
 
     warning = data.get("warning")
     if warning:
@@ -137,33 +240,58 @@ def render_result(data: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="근골격계질환 예방 운동 추천", page_icon="🧍", layout="centered")
-    st.title("사진 기반 근골격계질환 예방 운동 추천")
-    st.caption("사진을 기반으로 자세를 추정해 예방 운동을 제안합니다. 의료 진단 서비스가 아닙니다.")
+    st.set_page_config(page_title="자세 기반 예방 운동 추천", page_icon="🧍", layout="wide")
+    apply_styles()
 
-    with st.sidebar:
-        st.header("설정")
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>사진 기반 근골격계 예방 운동 추천</h1>
+            <p>사진 한 장으로 자세 위험 신호를 추정하고, 바로 실천할 수 있는 운동을 안내합니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1.15, 1], gap="large")
+
+    with left:
+        st.markdown("### 사용 순서")
+        st.markdown("<div class='step'>1) 자세가 잘 보이는 사진을 업로드하세요.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='step'>2) 분석 버튼을 누르고 5~10초 기다리세요.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='step'>3) 위험도와 운동/생활 습관 가이드를 확인하세요.</div>", unsafe_allow_html=True)
+
+        uploaded = st.file_uploader(
+            "자세가 보이는 사진 업로드 (jpg, jpeg, png)",
+            type=["jpg", "jpeg", "png"],
+        )
+
+        if uploaded:
+            image = Image.open(uploaded).convert("RGB")
+            st.image(image, caption="업로드된 사진", use_container_width=True)
+            run = st.button("분석하고 운동 추천 받기", type="primary", use_container_width=True)
+        else:
+            image = None
+            run = False
+
+    with right:
+        st.markdown("### 설정")
         default_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        model = st.text_input("OpenAI 모델", value=default_model)
-        st.write("환경변수 `OPENAI_API_KEY` 가 필요합니다.")
+        model = st.text_input("OpenAI 모델", value=default_model, help="예: gpt-4.1-mini")
+        st.caption("환경변수 `OPENAI_API_KEY`가 필요합니다.")
+        st.info("이 서비스는 의료 진단이 아닌 예방 목적의 참고 가이드입니다.")
 
-    uploaded = st.file_uploader("자세가 보이는 전신/상반신 사진 업로드", type=["jpg", "jpeg", "png"])
+    if run and image is not None:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("`OPENAI_API_KEY` 환경변수가 설정되지 않았습니다.")
+            st.stop()
 
-    if uploaded:
-        image = Image.open(uploaded).convert("RGB")
-        st.image(image, caption="업로드된 사진", use_container_width=True)
-
-        if st.button("분석하고 운동 추천 받기", type="primary"):
-            if not os.getenv("OPENAI_API_KEY"):
-                st.error("`OPENAI_API_KEY` 환경변수가 설정되지 않았습니다.")
-                st.stop()
-
-            with st.spinner("사진을 분석하고 있습니다..."):
-                try:
-                    result = analyze_posture(image, model=model)
-                    render_result(result)
-                except Exception as exc:
-                    st.error(f"분석 중 오류가 발생했습니다: {exc}")
+        with st.spinner("사진을 분석하고 있습니다..."):
+            try:
+                result = analyze_posture(image, model=model)
+                render_result(result)
+            except Exception as exc:
+                st.error(f"분석 중 오류가 발생했습니다: {exc}")
 
 
 if __name__ == "__main__":
